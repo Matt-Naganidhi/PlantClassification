@@ -8,7 +8,7 @@ import seaborn as sns
 from PIL import Image
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
-
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,21 +41,23 @@ CLASSES = [
 # Configuration parameters
 class Config:
     data_dir = 'B:\DeepLearning\dataset'  # Change this to your dataset path
-    img_size = 640
+    img_size = 100
     batch_size = 16
-    num_workers = 4
-    num_epochs = 50
+    num_workers = 6
+    num_epochs = 2
     learning_rate = 1e-3
     weight_decay = 5e-4
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     save_dir = 'models'
     log_dir = 'logs'
     early_stopping_patience = 10
     class_weights = False  # Set to True to use class weights
+    print("loaded config parameters")
 
 # Make sure save directories exist
 for directory in [Config.save_dir, Config.log_dir]:
     os.makedirs(directory, exist_ok=True)
+    print("backup directory located")
 
 # Basic building blocks
 class ConvBnSiLU(nn.Module):
@@ -64,9 +66,11 @@ class ConvBnSiLU(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=kernel_size//2, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
+        #combination of sigmoid and relu in terms of properties
         self.act = nn.SiLU(inplace=True)
     
     def forward(self, x):
+        print("processing forward pass: Convolve, batch norm, SiLU activation...")
         return self.act(self.bn(self.conv(x)))
 
 class Bottleneck(nn.Module):
@@ -75,34 +79,60 @@ class Bottleneck(nn.Module):
         super().__init__()
         self.cbs1 = ConvBnSiLU(in_channels, out_channels, kernel_size=1)
         self.cbs2 = ConvBnSiLU(out_channels, out_channels, kernel_size=k)
+        
+        # Add a projection shortcut if dimensions don't match
+        self.has_proj = in_channels != out_channels
+        if self.has_proj:
+            self.proj = ConvBnSiLU(in_channels, out_channels, kernel_size=1)
     
     def forward(self, x):
-        return x + self.cbs2(self.cbs1(x))
+        print("processing forward pass: reducing dimension...")
+        if self.has_proj:
+            return self.proj(x) + self.cbs2(self.cbs1(x))
+        else:
+            return x + self.cbs2(self.cbs1(x))
 
 class C2f(nn.Module):
     """C2f module as shown in Figure 6"""
     def __init__(self, in_channels, out_channels, n=3):
         super().__init__()
+        self.n = n
         self.in_conv = ConvBnSiLU(in_channels, out_channels, kernel_size=1)
-        self.out_conv = ConvBnSiLU(out_channels + out_channels // n, out_channels, kernel_size=1)
-    
         
-        # Create n parallel bottlenecks
+        # Calculate exact chunk sizes to handle uneven division
+        print("calculating chunk size...")
+        self.chunk_sizes = []
+        for i in range(n):
+            size = out_channels // n
+            if i < out_channels % n:  # Distribute remainder
+                size += 1
+            self.chunk_sizes.append(size)
+        
+        # Calculate total channels after concatenation
+        # First chunk + all processed chunks
+        concat_channels = self.chunk_sizes[0] + sum(self.chunk_sizes)
+        self.out_conv = ConvBnSiLU(concat_channels, out_channels, kernel_size=1)
+        
+        # Create bottlenecks with exact sizes
         self.bottlenecks = nn.ModuleList([
-            Bottleneck(out_channels // n, out_channels // n)
-            for _ in range(n)
+            Bottleneck(size, size)
+            for size in self.chunk_sizes
         ])
     
     def forward(self, x):
         x = self.in_conv(x)
+        print("splitting tensors...")
+        # Split tensor into chunks with the exact pre-calculated sizes
+        xs = []
+        start_idx = 0
+        for size in self.chunk_sizes:
+            xs.append(x[:, start_idx:start_idx+size, :, :])
+            start_idx += size
         
-        # Split the channels into n equal parts
-        xs = torch.chunk(x, len(self.bottlenecks), dim=1)
-        
-        # Process each part through bottlenecks
+        # Process each chunk through its bottleneck
         processed = [bottleneck(part) for bottleneck, part in zip(self.bottlenecks, xs)]
         
-        # Concatenate results
+        # Concatenate first chunk with all processed chunks
         out = torch.cat([xs[0]] + processed, dim=1)
         
         return self.out_conv(out)
@@ -119,6 +149,7 @@ class SPP(nn.Module):
         ])
     
     def forward(self, x):
+        print("foward processing: pyramid pooling layer...")
         x = self.cv1(x)
         return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
@@ -136,6 +167,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
+        print("processing attention mechanism")
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -153,6 +185,7 @@ class MLP(nn.Module):
     """MLP module for the Transformer block"""
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.0):
         super().__init__()
+        print("processing MLP...")
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         
@@ -174,6 +207,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0, qkv_bias=False, 
                  drop=0.0, attn_drop=0.0, drop_path=0.0):
         super().__init__()
+        print("processing transformer...")
         self.norm1 = nn.LayerNorm(dim)
         self.attn = MultiHeadSelfAttention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, 
@@ -187,6 +221,7 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
+        print("performing forward pass in transformer block...")
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
@@ -211,16 +246,17 @@ class C3TR(nn.Module):
         x = self.conv_in(x)
         
         # Reshape for transformer: [B, C, H, W] -> [B, C, H*W] -> [B, H*W, C]
+        print("reshaping transfomer...")
         B, C, H, W = x.shape
         x_flat = x.flatten(2).transpose(1, 2)
-        
+        print("applying transformer...")
         # Apply transformer blocks
         for block in self.transformer:
             x_flat = block(x_flat)
         
         # Reshape back to [B, C, H, W]
         x_reshaped = x_flat.transpose(1, 2).view(B, C, H, W)
-        
+        print("convolving...")
         # Final convolution
         x = self.conv_out(x_reshaped)
         x = self.conv_final(x)
@@ -249,6 +285,7 @@ class FocusModule(nn.Module):
     
     def forward(self, x):
         # Create 4 slices: top-left, top-right, bottom-left, bottom-right
+        print("creating slices...")
         slices = []
         
         # Top-left
@@ -329,6 +366,7 @@ class YOLOv8TransformerClassifier(nn.Module):
 class ImageFolderWithPaths(datasets.ImageFolder):
     """Custom dataset that includes image file paths"""
     def __getitem__(self, index):
+        print("fetching image path...")
         # Get the original tuple (image, label)
         img, label = super(ImageFolderWithPaths, self).__getitem__(index)
         # Get the path to the image file
@@ -337,7 +375,7 @@ class ImageFolderWithPaths(datasets.ImageFolder):
 
 def get_data_loaders(data_dir, img_size, batch_size, num_workers):
     """Create and return train and test data loaders from directory structure"""
-    
+    print("preprocessing data...")
     # Define transforms for training and testing
     train_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),
@@ -405,6 +443,7 @@ def get_data_loaders(data_dir, img_size, batch_size, num_workers):
 # Training Functions
 def train_one_epoch(model, train_loader, criterion, optimizer, device):
     """Train the model for one epoch"""
+    print("training...")
     model.train()
     running_loss = 0.0
     correct = 0
@@ -412,7 +451,13 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
     
     progress_bar = tqdm(train_loader, desc="Training")
     
-    for inputs, labels in progress_bar:
+    for batch in progress_bar:
+        # Handle different return formats (with or without paths)
+        if len(batch) == 3:
+            inputs, labels, _ = batch  # Ignore paths if present
+        else:
+            inputs, labels = batch
+            
         inputs, labels = inputs.to(device), labels.to(device)
         
         # Zero the parameter gradients
@@ -420,9 +465,11 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         
         # Forward pass
         outputs = model(inputs)
+        print("calculating loss...")
         loss = criterion(outputs, labels)
         
         # Backward pass and optimize
+        print("backpropagating...")
         loss.backward()
         optimizer.step()
         
@@ -443,6 +490,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
 
 def validate(model, val_loader, criterion, device):
     """Validate the model on the validation set"""
+    print("validating model...")
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -453,7 +501,13 @@ def validate(model, val_loader, criterion, device):
     all_targets = []
     
     with torch.no_grad():
-        for inputs, labels in tqdm(val_loader, desc="Validation"):
+        for batch in tqdm(val_loader, desc="Validation"):
+            # Handle both cases: with or without paths
+            if len(batch) == 3:
+                inputs, labels, _ = batch  # Unpack and ignore the paths
+            else:
+                inputs, labels = batch
+                
             inputs, labels = inputs.to(device), labels.to(device)
             
             # Forward pass
@@ -479,23 +533,32 @@ def validate(model, val_loader, criterion, device):
 
 def evaluate_model(model, test_loader, device, class_names):
     """Evaluate model performance with detailed metrics"""
+    print("evaluating model...")
     model.eval()
     all_predictions = []
     all_targets = []
     all_image_paths = []
     
     with torch.no_grad():
-        for inputs, labels, paths in tqdm(test_loader, desc="Testing"):
+        for batch in tqdm(test_loader, desc="Testing"):
+            # Handle both cases: with or without paths
+            if len(batch) == 3:
+                inputs, labels, paths = batch
+                all_image_paths.extend(paths)
+            else:
+                inputs, labels = batch
+                # Create dummy paths if real paths aren't available
+                all_image_paths.extend(["unknown_path"] * labels.size(0))
+                
             inputs, labels = inputs.to(device), labels.to(device)
             
             # Forward pass
             outputs = model(inputs)
             _, predicted = outputs.max(1)
             
-            # Store predictions, targets, and image paths
+            # Store predictions and targets
             all_predictions.extend(predicted.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
-            all_image_paths.extend(paths)
     
     # Convert lists to numpy arrays
     y_true = np.array(all_targets)
@@ -539,6 +602,7 @@ def evaluate_model(model, test_loader, device, class_names):
 
 def plot_results(results, class_names):
     """Plot and save evaluation results"""
+    print("plotting results...")
     # Create figure with multiple subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
@@ -605,7 +669,7 @@ def save_misclassified_examples(results, num_examples=10):
     plt.savefig(os.path.join(Config.log_dir, 'misclassified_examples.png'))
     plt.close()
 
-def predict_single_image(model, image_path, class_names, device, img_size=640):
+def predict_single_image(model, image_path, class_names, device, img_size=100):
     """Predict the class of a single image"""
     # Load and transform the image
     transform = transforms.Compose([
@@ -757,7 +821,7 @@ def prepare_inference_model(model_path):
     return model
 
 # Batch inference for multiple images
-def batch_inference(model, image_dir, class_names, device, img_size=640):
+def batch_inference(model, image_dir, class_names, device, img_size=100):
     """Run inference on all images in a directory"""
     # Get all image files
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
