@@ -36,9 +36,11 @@ CLASSES = [
     'mosaic', 'ragged_stunt', 'virus', 'worm'
 ]
 
+
+
 # Configuration parameters
 class Config:
-    data_dir = 'dataset'  # Change this to your dataset path
+    data_dir = 'B:\DeepLearning\dataset'  # Change this to your dataset path
     img_size = 640
     batch_size = 16
     num_workers = 4
@@ -82,7 +84,8 @@ class C2f(nn.Module):
     def __init__(self, in_channels, out_channels, n=3):
         super().__init__()
         self.in_conv = ConvBnSiLU(in_channels, out_channels, kernel_size=1)
-        self.out_conv = ConvBnSiLU(out_channels, out_channels, kernel_size=1)
+        self.out_conv = ConvBnSiLU(out_channels + out_channels // n, out_channels, kernel_size=1)
+    
         
         # Create n parallel bottlenecks
         self.bottlenecks = nn.ModuleList([
