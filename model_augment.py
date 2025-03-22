@@ -2,11 +2,13 @@ import os
 import time
 import copy
 import random
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
 from tqdm import tqdm
+from datetime import datetime
 from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
 import pandas as pd
 import torch
@@ -16,6 +18,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, datasets
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torchvision.transforms.functional as TF
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -36,12 +39,40 @@ CLASSES = [
     'mosaic', 'ragged_stunt', 'virus', 'worm'
 ]
 
+# Configuration parameters
+class Config:
+    data_dir = 'B:\DeepLearning\dataset'  # Change this to your dataset path
+    img_size = 180
+    batch_size = 16
+    num_workers = 6
+    num_epochs = 50
+    learning_rate = 1e-3
+    weight_decay = 5e-4
+    device = torch.device('cpu') #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    save_dir = 'models'
+    log_dir = 'logs'
+    early_stopping_patience = 10
+    class_weights = False  # Set to True to use class weights
+    checkpoint_freq = 5    # Save checkpoint every N epochs
+    resume_training = True # Set to False to start fresh training
+
+# Make sure save directories exist
+for directory in [Config.save_dir, Config.log_dir]:
+    os.makedirs(directory, exist_ok=True)
+
 # Custom data augmentation transform class
 class CustomAugmentation:
     """Advanced data augmentation with multiple techniques"""
-    def __init__(self, img_size=100, prob=0.5):
+    def __init__(self, img_size=180, prob=0.5):
         self.img_size = img_size
         self.prob = prob
+        # Define the random erasing transform separately
+        self.random_erasing = transforms.RandomErasing(
+            p=prob,
+            scale=(0.02, 0.33),
+            ratio=(0.3, 3.3),
+            value='random'  # Use 'random' instead of scalar value
+        )
         
     def __call__(self, img):
         # Apply random crop and resize
@@ -80,35 +111,29 @@ class CustomAugmentation:
         img = TF.to_tensor(img)
         img = TF.normalize(img, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         
-        # Apply random erasing
+        # Apply random erasing using the predefined transform
         if random.random() < self.prob:
-            i, j, h, w, v = transforms.RandomErasing.get_params(
-                img, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0)
-            img[:, i:i+h, j:j+w] = v
+            img = self.random_erasing(img)
             
         return img
 
-
-# Configuration parameters
-class Config:
-    data_dir = 'B:\DeepLearning\dataset'  # Change this to your dataset path
-    img_size = 100
-    batch_size = 16
-    num_workers = 6
-    num_epochs = 2
-    learning_rate = 1e-3
-    weight_decay = 5e-4
-    device = torch.device('cpu')
-    save_dir = 'models'
-    log_dir = 'logs'
-    early_stopping_patience = 10
-    class_weights = False  # Set to True to use class weights
-    print("loaded config parameters")
-
-# Make sure save directories exist
-for directory in [Config.save_dir, Config.log_dir]:
-    os.makedirs(directory, exist_ok=True)
-    print("backup directory located")
+# Alternative simpler approach
+class SimpleCustomAugmentation:
+    """Simplified data augmentation using predefined transforms"""
+    def __init__(self, img_size=180):
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(30),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3), value='random')
+        ])
+        
+    def __call__(self, img):
+        return self.transform(img)
 
 # Basic building blocks
 class ConvBnSiLU(nn.Module):
@@ -117,11 +142,9 @@ class ConvBnSiLU(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=kernel_size//2, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
-        #combination of sigmoid and relu in terms of properties
         self.act = nn.SiLU(inplace=True)
     
     def forward(self, x):
-        print("processing forward pass: Convolve, batch norm, SiLU activation...")
         return self.act(self.bn(self.conv(x)))
 
 class Bottleneck(nn.Module):
@@ -137,7 +160,6 @@ class Bottleneck(nn.Module):
             self.proj = ConvBnSiLU(in_channels, out_channels, kernel_size=1)
     
     def forward(self, x):
-        print("processing forward pass: reducing dimension...")
         if self.has_proj:
             return self.proj(x) + self.cbs2(self.cbs1(x))
         else:
@@ -151,7 +173,6 @@ class C2f(nn.Module):
         self.in_conv = ConvBnSiLU(in_channels, out_channels, kernel_size=1)
         
         # Calculate exact chunk sizes to handle uneven division
-        print("calculating chunk size...")
         self.chunk_sizes = []
         for i in range(n):
             size = out_channels // n
@@ -172,7 +193,7 @@ class C2f(nn.Module):
     
     def forward(self, x):
         x = self.in_conv(x)
-        print("splitting tensors...")
+        
         # Split tensor into chunks with the exact pre-calculated sizes
         xs = []
         start_idx = 0
@@ -200,7 +221,6 @@ class SPP(nn.Module):
         ])
     
     def forward(self, x):
-        print("foward processing: pyramid pooling layer...")
         x = self.cv1(x)
         return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
@@ -218,7 +238,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
-        print("processing attention mechanism")
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -236,7 +255,6 @@ class MLP(nn.Module):
     """MLP module for the Transformer block"""
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.0):
         super().__init__()
-        print("processing MLP...")
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         
@@ -258,7 +276,6 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0, qkv_bias=False, 
                  drop=0.0, attn_drop=0.0, drop_path=0.0):
         super().__init__()
-        print("processing transformer...")
         self.norm1 = nn.LayerNorm(dim)
         self.attn = MultiHeadSelfAttention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, 
@@ -272,7 +289,6 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
-        print("performing forward pass in transformer block...")
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
@@ -297,17 +313,16 @@ class C3TR(nn.Module):
         x = self.conv_in(x)
         
         # Reshape for transformer: [B, C, H, W] -> [B, C, H*W] -> [B, H*W, C]
-        print("reshaping transfomer...")
         B, C, H, W = x.shape
         x_flat = x.flatten(2).transpose(1, 2)
-        print("applying transformer...")
+        
         # Apply transformer blocks
         for block in self.transformer:
             x_flat = block(x_flat)
         
         # Reshape back to [B, C, H, W]
         x_reshaped = x_flat.transpose(1, 2).view(B, C, H, W)
-        print("convolving...")
+        
         # Final convolution
         x = self.conv_out(x_reshaped)
         x = self.conv_final(x)
@@ -336,7 +351,6 @@ class FocusModule(nn.Module):
     
     def forward(self, x):
         # Create 4 slices: top-left, top-right, bottom-left, bottom-right
-        print("creating slices...")
         slices = []
         
         # Top-left
@@ -417,7 +431,6 @@ class YOLOv8TransformerClassifier(nn.Module):
 class ImageFolderWithPaths(datasets.ImageFolder):
     """Custom dataset that includes image file paths"""
     def __getitem__(self, index):
-        print("fetching image path...")
         # Get the original tuple (image, label)
         img, label = super(ImageFolderWithPaths, self).__getitem__(index)
         # Get the path to the image file
@@ -426,16 +439,10 @@ class ImageFolderWithPaths(datasets.ImageFolder):
 
 def get_data_loaders(data_dir, img_size, batch_size, num_workers):
     """Create and return train and test data loaders from directory structure"""
-    print("preprocessing data...")
+    
     # Define transforms for training and testing
     train_transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        CustomAugmentation(img_size=img_size, prob=0.5),
     ])
     
     test_transform = transforms.Compose([
@@ -494,12 +501,12 @@ def get_data_loaders(data_dir, img_size, batch_size, num_workers):
 # Training Functions
 def train_one_epoch(model, train_loader, criterion, optimizer, device):
     """Train the model for one epoch"""
-    print("training...")
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
     
+    epoch_start_time = time.time()
     progress_bar = tqdm(train_loader, desc="Training")
     
     for batch in progress_bar:
@@ -516,11 +523,9 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
         
         # Forward pass
         outputs = model(inputs)
-        print("calculating loss...")
         loss = criterion(outputs, labels)
         
         # Backward pass and optimize
-        print("backpropagating...")
         loss.backward()
         optimizer.step()
         
@@ -536,12 +541,13 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
             'acc': 100. * correct / total
         })
     
+    epoch_time = time.time() - epoch_start_time
+    
     # Return epoch statistics
-    return running_loss / total, 100. * correct / total
+    return running_loss / total, 100. * correct / total, epoch_time
 
 def validate(model, val_loader, criterion, device):
     """Validate the model on the validation set"""
-    print("validating model...")
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -550,6 +556,8 @@ def validate(model, val_loader, criterion, device):
     # Storage for prediction stats
     all_predictions = []
     all_targets = []
+    
+    val_start_time = time.time()
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validation"):
@@ -578,17 +586,19 @@ def validate(model, val_loader, criterion, device):
     # Calculate validation accuracy and loss
     val_loss = running_loss / total
     val_acc = 100. * correct / total
+    val_time = time.time() - val_start_time
     
     # Return validation statistics
-    return val_loss, val_acc, all_predictions, all_targets
+    return val_loss, val_acc, all_predictions, all_targets, val_time
 
 def evaluate_model(model, test_loader, device, class_names):
-    """Evaluate model performance with detailed metrics, handling edge cases like division by zero"""
-    print("evaluating model...")
+    """Evaluate model performance with detailed metrics"""
     model.eval()
     all_predictions = []
     all_targets = []
     all_image_paths = []
+    
+    eval_start_time = time.time()
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
@@ -611,19 +621,6 @@ def evaluate_model(model, test_loader, device, class_names):
             all_predictions.extend(predicted.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
     
-    # Check if we have any predictions
-    if not all_predictions:
-        print("Warning: No predictions were made. Cannot evaluate model.")
-        return {
-            'confusion_matrix': None,
-            'classification_report': None,
-            'misclassified': [],
-            'accuracy': 0.0,
-            'precision': 0.0,
-            'recall': 0.0,
-            'f1': 0.0
-        }
-    
     # Convert lists to numpy arrays
     y_true = np.array(all_targets)
     y_pred = np.array(all_predictions)
@@ -631,85 +628,44 @@ def evaluate_model(model, test_loader, device, class_names):
     # Calculate confusion matrix
     cm = confusion_matrix(y_true, y_pred)
     
-    # Calculate accuracy safely
-    accuracy = np.mean(y_true == y_pred) if len(y_true) > 0 else 0.0
+    # Calculate precision, recall, and F1-score
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted')
     
-    # Initialize metrics with safe defaults
-    precision = recall = f1 = 0.0
-    class_report = {}
-    
-    try:
-        # Handle cases where certain classes might have no samples (0/0 division)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            # Calculate precision, recall, and F1-score with zero_division parameter
-            precision, recall, f1, _ = precision_recall_fscore_support(
-                y_true, y_pred, average='weighted', zero_division=0
-            )
-            
-            # Get detailed classification report with zero_division parameter
-            class_report = classification_report(
-                y_true, y_pred, target_names=class_names, 
-                output_dict=True, zero_division=0
-            )
-    except Exception as e:
-        print(f"Warning: Error calculating metrics: {str(e)}")
-        # Keep the default values initialized earlier
+    # Get detailed classification report
+    class_report = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
     
     # Identify misclassified samples
     misclassified_indices = np.where(y_true != y_pred)[0]
-    misclassified = []
+    misclassified = [
+        {
+            'path': all_image_paths[i],
+            'true_label': class_names[y_true[i]],
+            'pred_label': class_names[y_pred[i]]
+        }
+        for i in misclassified_indices
+    ]
     
-    # Safely process misclassified samples
-    for i in misclassified_indices:
-        if i < len(all_image_paths) and y_true[i] < len(class_names) and y_pred[i] < len(class_names):
-            misclassified.append({
-                'path': all_image_paths[i],
-                'true_label': class_names[y_true[i]],
-                'pred_label': class_names[y_pred[i]]
-            })
-    
-    # Print results with safety checks
-    print(f"\nTest Accuracy: {100 * accuracy:.2f}%")
+    # Print results
+    print(f"\nTest Accuracy: {100 * np.mean(y_true == y_pred):.2f}%")
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"F1 Score: {f1:.4f}")
     
-    # Check if any class had 0 samples in ground truth
-    zero_sample_classes = []
-    for i, class_name in enumerate(class_names):
-        if i in y_true:
-            if np.sum(y_true == i) == 0:
-                zero_sample_classes.append(class_name)
-    
-    if zero_sample_classes:
-        print(f"Warning: The following classes had 0 samples in the test set: {', '.join(zero_sample_classes)}")
-        print("Metrics for these classes may not be reliable.")
-    
-    # Check for classes with no predictions
-    zero_pred_classes = []
-    for i, class_name in enumerate(class_names):
-        if i in y_pred:
-            if np.sum(y_pred == i) == 0:
-                zero_pred_classes.append(class_name)
-    
-    if zero_pred_classes:
-        print(f"Warning: The model made no predictions for these classes: {', '.join(zero_pred_classes)}")
-        print("Precision for these classes will be reported as 0.")
+    eval_time = time.time() - eval_start_time
     
     return {
         'confusion_matrix': cm,
         'classification_report': class_report,
         'misclassified': misclassified,
-        'accuracy': accuracy,
+        'accuracy': np.mean(y_true == y_pred),
         'precision': precision,
         'recall': recall,
-        'f1': f1
+        'f1': f1,
+        'eval_time': eval_time
     }
 
-def plot_results(results, class_names):
+def plot_results(results, class_names, log_dir):
     """Plot and save evaluation results"""
-    print("plotting results...")
     # Create figure with multiple subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
@@ -738,16 +694,19 @@ def plot_results(results, class_names):
     
     # Tight layout and save
     plt.tight_layout()
-    plt.savefig(os.path.join(Config.log_dir, 'evaluation_results.png'))
+    plt.savefig(os.path.join(log_dir, 'evaluation_results.png'))
     plt.close()
+    
+    # Return for displaying
+    return fig
 
-def save_misclassified_examples(results, num_examples=10):
+def save_misclassified_examples(results, log_dir, num_examples=10):
     """Save a sample of misclassified images for analysis"""
     misclassified = results['misclassified']
     
     if len(misclassified) == 0:
         print("No misclassified examples to show!")
-        return
+        return None
     
     # Randomly sample misclassified examples
     samples = random.sample(misclassified, min(num_examples, len(misclassified)))
@@ -773,10 +732,13 @@ def save_misclassified_examples(results, num_examples=10):
         axes[j].axis('off')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(Config.log_dir, 'misclassified_examples.png'))
+    plt.savefig(os.path.join(log_dir, 'misclassified_examples.png'))
     plt.close()
+    
+    # Return for displaying
+    return fig
 
-def predict_single_image(model, image_path, class_names, device, img_size=100):
+def predict_single_image(model, image_path, class_names, device, img_size=150):
     """Predict the class of a single image"""
     # Load and transform the image
     transform = transforms.Compose([
@@ -812,9 +774,106 @@ def predict_single_image(model, image_path, class_names, device, img_size=100):
         'top3_predictions': top3_predictions
     }
 
+def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, val_loss, 
+                    train_acc, train_loss, filename, metadata=None):
+    """Save model checkpoint with all training information"""
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'val_acc': val_acc,
+        'val_loss': val_loss,
+        'train_acc': train_acc,
+        'train_loss': train_loss,
+        'metadata': metadata or {}
+    }, filename)
+    print(f"Checkpoint saved to {filename}")
+
+def load_checkpoint(filename, model, optimizer=None, scheduler=None):
+    """Load model checkpoint and return training information"""
+    if not os.path.exists(filename):
+        print(f"No checkpoint found at {filename}")
+        return None
+    
+    checkpoint = torch.load(filename, map_location=Config.device)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Optionally load optimizer and scheduler states
+    if optimizer and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    print(f"Loaded checkpoint from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['val_acc']:.2f}%")
+    
+    return checkpoint
+
+def save_training_history(history, filename):
+    """Save training history to JSON file"""
+    with open(filename, 'w') as f:
+        json.dump(history, f, indent=4)
+    print(f"Training history saved to {filename}")
+
+def load_training_history(filename):
+    """Load training history from JSON file"""
+    if not os.path.exists(filename):
+        return []
+    
+    with open(filename, 'r') as f:
+        history = json.load(f)
+    
+    return history
+
+def plot_training_history(history, filename):
+    """Plot training history and save to file"""
+    epochs = [entry['epoch'] for entry in history]
+    train_loss = [entry['train_loss'] for entry in history]
+    val_loss = [entry['val_loss'] for entry in history]
+    train_acc = [entry['train_acc'] for entry in history]
+    val_acc = [entry['val_acc'] for entry in history]
+    
+    # Create figure with multiple subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot loss
+    ax1.plot(epochs, train_loss, 'b-', label='Training Loss')
+    ax1.plot(epochs, val_loss, 'r-', label='Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Training and Validation Loss')
+    ax1.legend()
+    
+    # Plot accuracy
+    ax2.plot(epochs, train_acc, 'b-', label='Training Accuracy')
+    ax2.plot(epochs, val_acc, 'r-', label='Validation Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.set_title('Training and Validation Accuracy')
+    ax2.legend()
+    
+    # Tight layout and save
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    
+    # Return for displaying
+    return fig
+
 # Main training function
-def train_and_evaluate():
-    """Full training and evaluation pipeline"""
+def train_and_evaluate(resume_training=None):
+    """Full training and evaluation pipeline with option to resume training"""
+    
+    # Initialize training variables
+    start_epoch = 0
+    best_val_acc = 0.0
+    patience_counter = 0
+    history = []
+    training_start_time = time.time()
+    
     # Setup data loaders
     train_loader, test_loader, class_weights = get_data_loaders(
         Config.data_dir, Config.img_size, Config.batch_size, Config.num_workers
@@ -824,6 +883,13 @@ def train_and_evaluate():
     model = YOLOv8TransformerClassifier(in_channels=3, num_classes=len(CLASSES))
     model = model.to(Config.device)
     
+    # Define optimizer
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=Config.learning_rate, 
+        weight_decay=Config.weight_decay
+    )
+    
     # Define loss function
     if Config.class_weights and class_weights is not None:
         class_weights = class_weights.to(Config.device)
@@ -831,13 +897,6 @@ def train_and_evaluate():
         print("Using weighted loss function")
     else:
         criterion = nn.CrossEntropyLoss()
-    
-    # Define optimizer
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=Config.learning_rate, 
-        weight_decay=Config.weight_decay
-    )
     
     # Learning rate scheduler
     scheduler = ReduceLROnPlateau(
@@ -848,44 +907,113 @@ def train_and_evaluate():
         verbose=True
     )
     
-    # Training loop
-    best_val_acc = 0.0
-    best_model_weights = None
-    patience_counter = 0
+    # Create metadata dictionary for tracking
+    metadata = {
+        'train_start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'device': str(Config.device),
+        'data_dir': Config.data_dir,
+        'img_size': Config.img_size,
+        'batch_size': Config.batch_size,
+        'initial_lr': Config.learning_rate,
+    }
+    
+    # Path for checkpoints
+    best_model_path = os.path.join(Config.save_dir, 'best_model.pth')
+    latest_model_path = os.path.join(Config.save_dir, 'latest_model.pth')
+    history_path = os.path.join(Config.log_dir, 'training_history.json')
+    
+    # Try to resume training if specified
+    if resume_training is None:
+        resume_training = Config.resume_training
+        
+    if resume_training:
+        # Try to load best model first, then latest
+        checkpoint = load_checkpoint(best_model_path, model, optimizer, scheduler)
+        if checkpoint is None:
+            checkpoint = load_checkpoint(latest_model_path, model, optimizer, scheduler)
+        
+        if checkpoint:
+            start_epoch = checkpoint['epoch']
+            best_val_acc = checkpoint['val_acc']
+            print(f"Resuming training from epoch {start_epoch+1} with best validation accuracy: {best_val_acc:.2f}%")
+            
+            # Load training history
+            history = load_training_history(history_path)
     
     print(f"Starting training on {Config.device}")
-    for epoch in range(1, Config.num_epochs + 1):
+    print(f"Training from epoch {start_epoch+1} to {Config.num_epochs}")
+    
+    # Training loop
+    for epoch in range(start_epoch + 1, Config.num_epochs + 1):
         print(f"\nEpoch {epoch}/{Config.num_epochs}")
         
         # Train
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, Config.device)
+        train_loss, train_acc, epoch_time = train_one_epoch(model, train_loader, criterion, optimizer, Config.device)
         
         # Validate
-        val_loss, val_acc, predictions, targets = validate(model, test_loader, criterion, Config.device)
+        val_loss, val_acc, predictions, targets, val_time = validate(model, test_loader, criterion, Config.device)
         
         # Update learning rate
         scheduler.step(val_loss)
         
         # Print epoch results
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Time: {epoch_time:.2f}s")
+        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Time: {val_time:.2f}s")
+        
+        # Save epoch statistics
+        epoch_stats = {
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'lr': optimizer.param_groups[0]['lr'],
+            'epoch_time': epoch_time,
+            'val_time': val_time,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        history.append(epoch_stats)
+        
+        # Save latest model
+        save_checkpoint(
+            model, optimizer, scheduler, epoch, val_acc, val_loss, 
+            train_acc, train_loss, latest_model_path, 
+            metadata={
+                **metadata,
+                'history': epoch_stats,
+                'training_time_so_far': time.time() - training_start_time
+            }
+        )
+        
+        # Save training history
+        save_training_history(history, history_path)
+        
+        # Plot training history
+        plot_training_history(history, os.path.join(Config.log_dir, 'training_history.png'))
+        
+        # Periodic checkpoints
+        if epoch % Config.checkpoint_freq == 0:
+            checkpoint_path = os.path.join(Config.save_dir, f'model_epoch_{epoch}.pth')
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_acc, val_loss, 
+                train_acc, train_loss, checkpoint_path
+            )
         
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_model_weights = copy.deepcopy(model.state_dict())
             patience_counter = 0
             
             # Save the model
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-                'train_acc': train_acc,
-                'train_loss': train_loss
-            }, os.path.join(Config.save_dir, 'best_model.pth'))
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_acc, val_loss, 
+                train_acc, train_loss, best_model_path,
+                metadata={
+                    **metadata,
+                    'best_epoch': epoch,
+                    'training_time': time.time() - training_start_time
+                }
+            )
             print(f"Saved best model with validation accuracy: {val_acc:.2f}%")
         else:
             patience_counter += 1
@@ -895,40 +1023,77 @@ def train_and_evaluate():
             print(f"Early stopping triggered after {epoch} epochs.")
             break
     
+    # Total training time
+    total_training_time = time.time() - training_start_time
+    print(f"Training completed in {total_training_time:.2f} seconds")
     print(f"Best validation accuracy: {best_val_acc:.2f}%")
     
+    # Update metadata
+    metadata.update({
+        'best_val_acc': best_val_acc,
+        'total_training_time': total_training_time,
+        'train_end_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+    
     # Load best model for evaluation
-    model.load_state_dict(best_model_weights)
+    checkpoint = load_checkpoint(best_model_path, model)
     
     # Final evaluation
+    print("Performing final evaluation...")
     results = evaluate_model(model, test_loader, Config.device, CLASSES)
     
     # Plot results
     try:
         import pandas as pd
-        plot_results(results, CLASSES)
-        save_misclassified_examples(results)
+        plot_results(results, CLASSES, Config.log_dir)
+        save_misclassified_examples(results, Config.log_dir)
     except ImportError:
         print("Pandas or Matplotlib not available. Skipping visualization.")
+    
+    # Save evaluation results
+    evaluation_path = os.path.join(Config.log_dir, 'evaluation_results.json')
+    with open(evaluation_path, 'w') as f:
+        # Convert numpy arrays to lists for JSON serialization
+        serializable_results = {}
+        for k, v in results.items():
+            if k == 'confusion_matrix':
+                serializable_results[k] = v.tolist()
+            elif isinstance(v, np.ndarray):
+                serializable_results[k] = v.tolist()
+            else:
+                serializable_results[k] = v
+                
+        # Add metadata
+        serializable_results['metadata'] = metadata
+                
+        json.dump(serializable_results, f, indent=4)
+    
+    print(f"Evaluation results saved to {evaluation_path}")
     
     return model, results
 
 # Inference function for deployment
-def prepare_inference_model(model_path):
+def prepare_inference_model(model_path=None):
     """Load trained model for inference"""
+    if model_path is None:
+        model_path = os.path.join(Config.save_dir, 'best_model.pth')
+        
     # Initialize model
     model = YOLOv8TransformerClassifier(in_channels=3, num_classes=len(CLASSES))
     
     # Load model weights
-    checkpoint = torch.load(model_path, map_location=Config.device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    checkpoint = load_checkpoint(model_path, model)
+    if checkpoint is None:
+        print(f"No model found at {model_path}. Please train the model first.")
+        return None
+        
     model = model.to(Config.device)
     model.eval()
     
     return model
 
 # Batch inference for multiple images
-def batch_inference(model, image_dir, class_names, device, img_size=100):
+def batch_inference(model, image_dir, class_names, device, img_size=150):
     """Run inference on all images in a directory"""
     # Get all image files
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
@@ -939,9 +1104,15 @@ def batch_inference(model, image_dir, class_names, device, img_size=100):
         if os.path.splitext(file.lower())[1] in image_extensions
     ]
     
+    if not image_files:
+        print(f"No images found in {image_dir}")
+        return []
+    
+    print(f"Found {len(image_files)} images for inference")
     results = []
     
     # Process each image
+    inference_start_time = time.time()
     for image_path in tqdm(image_files, desc="Processing images"):
         try:
             prediction = predict_single_image(model, image_path, class_names, device, img_size)
@@ -954,32 +1125,74 @@ def batch_inference(model, image_dir, class_names, device, img_size=100):
         except Exception as e:
             print(f"Error processing {image_path}: {e}")
     
-    # Save results to CSV
-    results_df = pd.DataFrame(results)
-    output_path = os.path.join(os.path.dirname(image_dir), 'inference_results.csv')
-    results_df.to_csv(output_path, index=False)
+    inference_time = time.time() - inference_start_time
     
-    print(f"Results saved to {output_path}")
+    # Save results to CSV
+    try:
+        import pandas as pd
+        results_df = pd.DataFrame(results)
+        output_path = os.path.join(os.path.dirname(image_dir), f'inference_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        results_df.to_csv(output_path, index=False)
+        print(f"Results saved to {output_path}")
+    except ImportError:
+        print("Pandas not available. Saving results as JSON.")
+        output_path = os.path.join(os.path.dirname(image_dir), f'inference_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=4)
+        print(f"Results saved to {output_path}")
+    
+    print(f"Inference completed in {inference_time:.2f} seconds for {len(results)} images")
+    print(f"Average inference time per image: {inference_time/len(results):.4f} seconds")
+    
     return results
 
-if __name__ == "__main__":
-    # Run the training pipeline
-    print("Starting plant disease classification training...")
-    model, results = train_and_evaluate()
-    print("Training completed!")
+def main():
+    """Main function to handle training and inference"""
+    import argparse
     
-    # Example of using the trained model for inference
-    print("\nExample inference:")
-    model_path = os.path.join(Config.save_dir, 'best_model.pth')
-    inference_model = prepare_inference_model(model_path)
+    parser = argparse.ArgumentParser(description='Plant Disease Classification')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'infer'],
+                        help='Operation mode: train or infer')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from checkpoint')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to model for inference')
+    parser.add_argument('--image_dir', type=str, default=None,
+                        help='Directory of images for inference')
     
-    # Replace this with your own test image path
-    test_image_path = os.path.join(Config.data_dir, 'test', CLASSES[0], os.listdir(os.path.join(Config.data_dir, 'test', CLASSES[0]))[0])
+    args = parser.parse_args()
     
-    prediction = predict_single_image(inference_model, test_image_path, CLASSES, Config.device)
-    print(f"Test image: {test_image_path}")
-    print(f"Predicted class: {prediction['predicted_class']}")
-    print(f"Confidence: {prediction['confidence']:.4f}")
-    print(f"Top 3 predictions: {prediction['top3_predictions']}")
+    if args.mode == 'train':
+        print("Starting plant disease classification training...")
+        # Override Config.resume_training with command line argument
+        resume_training = args.resume if args.resume is not None else Config.resume_training
+        model, results = train_and_evaluate(resume_training=resume_training)
+        print("Training completed!")
+    
+    elif args.mode == 'infer':
+        print("Starting inference mode...")
+        model = prepare_inference_model(args.model_path)
+        
+        if model is None:
+            print("Model loading failed. Exiting.")
+            return
+        
+        if args.image_dir:
+            # Batch inference
+            batch_inference(model, args.image_dir, CLASSES, Config.device, Config.img_size)
+        else:
+            # Example inference
+            print("\nExample inference:")
+            test_image_path = os.path.join(Config.data_dir, 'test', CLASSES[0], 
+                              os.listdir(os.path.join(Config.data_dir, 'test', CLASSES[0]))[0])
+            
+            prediction = predict_single_image(model, test_image_path, CLASSES, Config.device)
+            print(f"Test image: {test_image_path}")
+            print(f"Predicted class: {prediction['predicted_class']}")
+            print(f"Confidence: {prediction['confidence']:.4f}")
+            print(f"Top 3 predictions: {prediction['top3_predictions']}")
     
     print("\nDone!")
+
+if __name__ == "__main__":
+    main()
